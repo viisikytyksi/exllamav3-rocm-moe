@@ -118,6 +118,7 @@ int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin);  
 // has_avx512_vbmi and has_avx512_bw additionally gate the swizzled weight layout in the child
 // loader (the VBMI tier's wide swizzle bands need the byte-gather kernels' low temporary count).
 bool exl3_moe_cpu_has_avx2();
+bool exl3_moe_cpu_has_avxvnni();
 bool exl3_moe_cpu_has_avx512_bw();
 bool exl3_moe_cpu_has_avx512_vnni();
 bool exl3_moe_cpu_has_avx512_vbmi();

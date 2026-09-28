@@ -882,7 +882,7 @@ class MoeCpuHost:
         kern = "avx512-vbmi" if ext.exl3_moe_cpu_has_avx512_vbmi() else \
                ("avx512-vnni" if ext.exl3_moe_cpu_has_avx512_vnni() else \
                ("avx512-bw" if ext.exl3_moe_cpu_has_avx512_bw() else \
-               ("avx2" if ext.exl3_moe_cpu_has_avx2() else "scalar")))
+               ("avxvnni" if ext.exl3_moe_cpu_has_avxvnni() else ("avx2" if ext.exl3_moe_cpu_has_avx2() else "scalar"))))
         print(f" -- CPU MoE worker started: {len(self.specs)} layers, {kern}, {self.threads} threads")
 
     def _start_watchdog(self):

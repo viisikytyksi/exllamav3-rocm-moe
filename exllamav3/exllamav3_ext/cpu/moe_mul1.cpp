@@ -2305,6 +2305,7 @@ void exl3_moe_cpu_stage_experts
 }
 
 bool exl3_moe_cpu_has_avx2() { return g_isa != Isa::Scalar; }
+bool exl3_moe_cpu_has_avxvnni() { return g_isa == Isa::AvxVnni; }
 bool exl3_moe_cpu_has_avx512_bw() { return g_isa >= Isa::Bw; }
 bool exl3_moe_cpu_has_avx512_vnni() { return g_isa >= Isa::Vnni; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return g_isa == Isa::Vbmi; }
