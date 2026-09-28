@@ -70,12 +70,14 @@ constexpr int MAX_M = 4;
 
 #if defined(__GNUC__) && defined(__linux__)
 #define M1_TARGET_AVX2 __attribute__((target("avx2,fma,f16c")))
+#define M1_TARGET_AVXVNNI __attribute__((target("avx2,avxvnni,fma,f16c")))
 #define M1_TARGET_BW __attribute__((target("avx512f,avx512bw,avx512vl,fma,f16c")))
 #define M1_TARGET_VNNI __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,fma,f16c")))
 #define M1_TARGET_VBMI __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi,fma,f16c")))
 #define M1_ALWAYS_INLINE __attribute__((always_inline)) inline
 #else
 #define M1_TARGET_AVX2
+#define M1_TARGET_AVXVNNI
 #define M1_TARGET_BW
 #define M1_TARGET_VNNI
 #define M1_TARGET_VBMI
@@ -196,7 +198,7 @@ inline float decode_mul1_scalar(uint16_t state)
 // Declared early: the transforms below select on it. Vbmi = Vnni + AVX512-VBMI (Zen4+, Ice
 // Lake+); kept as a separate tier because Cascade/Cooper Lake have VNNI without VBMI. Bw =
 // AVX-512F/BW/VL without VNNI (Skylake-SP/X): the dword kernel with the AVX2-style accumulate.
-enum class Isa { Scalar, Avx2, Bw, Vnni, Vbmi };
+enum class Isa { Scalar, Avx2, AvxVnni, Bw, Vnni, Vbmi };
 extern const Isa g_isa;
 
 // -------------------------------------------------------------------------------------------
@@ -1291,6 +1293,100 @@ inline void avx2_rows_accum(
     }
 }
 
+M1_TARGET_AVXVNNI
+inline void avxvnni_accum_row(__m256i codes_lo, __m256i codes_hi, const int32_t* splat,
+    int k, int m, __m256i (&acc)[MAX_M][2], const __m256i& mult, int row)
+{
+    const __m256i p_lo = _mm256_mullo_epi32(codes_lo, mult);
+    const __m256i p_hi = _mm256_mullo_epi32(codes_hi, mult);
+    #define ACC_ROW(i) \
+        if ((i) < m) { \
+            const __m256i xs = _mm256_set1_epi32(splat[static_cast<size_t>(i) * k + row]); \
+            acc[i][0] = _mm256_dpbusd_epi32(acc[i][0], p_lo, xs); \
+            acc[i][1] = _mm256_dpbusd_epi32(acc[i][1], p_hi, xs); \
+        }
+    ACC_ROW(0) ACC_ROW(1) ACC_ROW(2) ACC_ROW(3)
+    #undef ACC_ROW
+}
+
+template <int bits, int row = 0>
+M1_TARGET_AVXVNNI
+inline void avxvnni_rows_accum(
+    const __m256i (&preg)[bits], const int32_t* splat, int k, int m, __m256i (&acc)[MAX_M][2],
+    const __m256i& mult)
+{
+    if constexpr (bits == 8)
+    {
+        if constexpr (row < 16)
+        {
+            static_assert(word_pair_ok<bits, row>(), "K8 pairs are fully eligible by layout");
+            const __m256i a_lo = avx2_gather_half<bits, row, false, 0>(preg);
+            const __m256i b_lo = avx2_gather_half<bits, row, true, 0>(preg);
+            const __m256i a_hi = avx2_gather_half<bits, row, false, 1>(preg);
+            const __m256i b_hi = avx2_gather_half<bits, row, true, 1>(preg);
+            constexpr int s0 = row_shift<bits, row>(0);
+            constexpr int s1 = row_shift<bits, row>(8);
+            const __m256i mask16 = _mm256_set1_epi32(0xffff);
+            __m256i codes_lo = _mm256_and_si256(_mm256_or_si256(
+                _mm256_srli_epi32(b_lo, s0), _mm256_slli_epi32(a_lo, 32 - s0)), mask16);
+            __m256i codes_hi = _mm256_and_si256(_mm256_or_si256(
+                _mm256_srli_epi32(b_hi, s1), _mm256_slli_epi32(a_hi, 32 - s1)), mask16);
+            avxvnni_accum_row(codes_lo, codes_hi, splat, k, m, acc, mult, row);
+            codes_lo = _mm256_and_si256(_mm256_or_si256(
+                _mm256_srli_epi32(b_lo, s0 - bits), _mm256_slli_epi32(a_lo, 32 - (s0 - bits))), mask16);
+            codes_hi = _mm256_and_si256(_mm256_or_si256(
+                _mm256_srli_epi32(b_hi, s1 - bits), _mm256_slli_epi32(a_hi, 32 - (s1 - bits))), mask16);
+            avxvnni_accum_row(codes_lo, codes_hi, splat, k, m, acc, mult, row + 1);
+            avxvnni_rows_accum<bits, row + 2>(preg, splat, k, m, acc, mult);
+        }
+    }
+    else if constexpr (row < 16)
+    {
+        __m256i codes_lo, codes_hi;
+        avx2_row_codes<bits, row>(preg, codes_lo, codes_hi);
+        avxvnni_accum_row(codes_lo, codes_hi, splat, k, m, acc, mult, row);
+        avxvnni_rows_accum<bits, row + 1>(preg, splat, k, m, acc, mult);
+    }
+}
+
+template <int bits>
+M1_TARGET_AVXVNNI
+void avxvnni_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
+{
+    const int tiles_k = mat.k / 16;
+    const int tiles_n = mat.n / 16;
+    constexpr int packed_size = 16 * bits;
+    const __m256i mult = _mm256_set1_epi32(static_cast<int32_t>(MUL1_MULT));
+    const int32_t* splat = in.splat32;
+    constexpr int pf_lines = (32 * bits + 63) / 64;
+    constexpr int pf_dist = (bits == 6) ? 2 : 4;
+    for (int tile_n = tn0; tile_n < tn1; ++tile_n)
+    {
+        __m256i acc[MAX_M][2];
+        for (int i = 0; i < m; ++i) { acc[i][0] = _mm256_setzero_si256(); acc[i][1] = _mm256_setzero_si256(); }
+        const uint16_t* packed = mat.trellis + static_cast<size_t>(tile_n) * packed_size;
+        const size_t row_stride = static_cast<size_t>(tiles_n) * packed_size;
+        for (int tile_k = 0; tile_k < tiles_k; ++tile_k, packed += row_stride)
+        {
+            const uint16_t* pf = packed + row_stride * pf_dist;
+            #pragma unroll
+            for (int l = 0; l < pf_lines; ++l) _mm_prefetch(reinterpret_cast<const char*>(pf) + l * 64, _MM_HINT_T0);
+            const int32_t* splat_k = splat + tile_k * 16;
+            __m256i preg[bits];
+            for (int i = 0; i < bits; ++i) preg[i] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + i * 16));
+            avxvnni_rows_accum<bits>(preg, splat_k, mat.k, m, acc, mult);
+        }
+        for (int i = 0; i < m; ++i)
+        {
+            const float scale = mul1_k_inv() * in.q[i];
+            const __m256 corr = _mm256_set1_ps(-510.0f * static_cast<float>(in.sum_x8[i]) * scale);
+            float* out = tout + static_cast<size_t>(i) * mat.n + tile_n * 16;
+            _mm256_storeu_ps(out, _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[i][0]), _mm256_set1_ps(scale), corr));
+            _mm256_storeu_ps(out + 8, _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc[i][1]), _mm256_set1_ps(scale), corr));
+        }
+    }
+}
+
 template <int bits>
 M1_TARGET_AVX2
 void avx2_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m, int tn0, int tn1)
@@ -1403,6 +1499,8 @@ Isa detect_isa()
         else
             hw = Isa::Bw;
     }
+    else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("avxvnni") && __builtin_cpu_supports("fma"))
+        hw = Isa::AvxVnni;
     else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"))
         hw = Isa::Avx2;
     else
@@ -1450,6 +1548,7 @@ Isa detect_isa()
         Isa cap;
         if (s == "scalar") cap = Isa::Scalar;
         else if (s == "avx2") cap = Isa::Avx2;
+        else if (s == "avxvnni" || s == "avx-vnni") cap = Isa::AvxVnni;
         else if (s == "bw" || s == "avx512bw") cap = Isa::Bw;
         else if (s == "vnni" || s == "avx512") cap = Isa::Vnni;
         else if (s == "vbmi") cap = Isa::Vbmi;
@@ -1583,6 +1682,20 @@ void run_tiles(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int m
                 case 8 * 4 + 3: bw_tiles<8, 4>(mat, in, tout, tn0, tn1); return;
             }
             return;
+        }
+        case Isa::AvxVnni:
+        {
+            switch (mat.bits)
+            {
+                case 1: avxvnni_tiles<1>(mat, in, tout, m, tn0, tn1); return;
+                case 2: avxvnni_tiles<2>(mat, in, tout, m, tn0, tn1); return;
+                case 3: avxvnni_tiles<3>(mat, in, tout, m, tn0, tn1); return;
+                case 4: avxvnni_tiles<4>(mat, in, tout, m, tn0, tn1); return;
+                case 5: avxvnni_tiles<5>(mat, in, tout, m, tn0, tn1); return;
+                case 6: avxvnni_tiles<6>(mat, in, tout, m, tn0, tn1); return;
+                case 7: avxvnni_tiles<7>(mat, in, tout, m, tn0, tn1); return;
+                default: avxvnni_tiles<8>(mat, in, tout, m, tn0, tn1); return;
+            }
         }
         case Isa::Avx2:
         {
@@ -2192,6 +2305,7 @@ void exl3_moe_cpu_stage_experts
 }
 
 bool exl3_moe_cpu_has_avx2() { return g_isa != Isa::Scalar; }
+bool exl3_moe_cpu_has_avxvnni() { return g_isa == Isa::AvxVnni; }
 bool exl3_moe_cpu_has_avx512_bw() { return g_isa >= Isa::Bw; }
 bool exl3_moe_cpu_has_avx512_vnni() { return g_isa >= Isa::Vnni; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return g_isa == Isa::Vbmi; }

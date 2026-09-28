@@ -5,13 +5,61 @@ ROCm/HIP port of [exllamav3](https://github.com/turboderp-org/exllamav3) for RDN
 run a model much larger than the GPU, **Qwen3.8-Flash-Next** (125B MoE, 512 experts, 6B active, plus a 51B
 hashed n-gram embedding table), on one RX 7900 XTX (24 GB) with 60 GB of system RAM:
 
-- the hottest experts of every layer stay in VRAM, the rest run on the CPU (AVX-512 VNNI/VBMI kernel reading
-  EXL3 `mul1` weights straight from RAM), overlapped with the GPU's own experts;
+- the hottest experts of every layer stay in VRAM, the rest run on the CPU (AVX2 or AVX-VNNI `mul1`
+  kernels reading EXL3 weights straight from RAM; AVX-512 tiers remain available where supported),
+  overlapped with the GPU's own experts;
 - the n-gram embedding table (33 GB at 3.05 bpw) stays on disk and is gathered per token from the page cache;
 - RDNA3 kernels for the MoE decode path, the gated-residual hyper-connections and the router.
 
 Everything from the dense port (Qwen3.8-27B, DFlash2/MTP drafting, RDNA3 EXL3 matmul, decode attention) is
 unchanged and documented further down.
+
+## Verified RX 7900 XTX / i7-12700F operating profile
+
+The following is the measured profile for an **AMD Radeon RX 7900 XTX (gfx1100, 24 GB)**, **Intel
+Core i7-12700F (DDR4 64 GB, AVX2 + AVX-VNNI, no AVX-512)**, ROCm 7.2, and the
+`3.05bpw_h5_ng5` Qwen3.8-Flash-Next EXL3 model. It supersedes the illustrative Ryzen/DDR5
+results below for this hardware; those upstream measurements remain as reference data.
+
+```text
+mcs=395
+mct=8
+taskset -c 0-15
+EXL3_MOE_CPU_SWAP=0
+EXL3_MOE_CPU_MAX_ISA=avxvnni
+EXL3_MOE_LEARN=0
+MTP disabled
+```
+
+`mcs` is the number of CPU-resident experts per layer; static placement keeps the learned hot-expert
+order fixed during decode. The benchmark used KV 4-bit, cache 4096, 128 generated tokens, prose/code
+prompts, and three repetitions per candidate.
+
+| mcs | prose | code | combined decode | VRAM allocated | OOM |
+|---:|---:|---:|---:|---:|:---:|
+| 390 | 49.700 | 46.233 | **47.961 tok/s** | 15.07 GiB | no |
+| 395 | 49.467 | 46.067 | **47.784 tok/s** | 14.65 GiB | no |
+| 400 | 48.100 | 43.533 | **45.820 tok/s** | 14.24 GiB | no |
+
+`mcs=395` was selected for the lower combined variance (`0.462 tok/s`) and additional VRAM headroom.
+`mcs=346` and below are not viable on this 24 GB card: previous trials OOMed.
+
+Static placement was confirmed against dynamic placement under the same initial placement and warmup:
+`47.617` vs `35.398 tok/s` (**+34.52%**). Dynamic expert swapping is therefore not the default
+for this workload.
+
+MTP was tested under the same `mcs=395` profile for 128 tokens and three repetitions:
+no-MTP `47.204 ± 0.391 tok/s`, MTP `37.227 ± 0.774 tok/s` (**-21.14%**). MTP used `+0.72 GiB`
+VRAM and repeatedly reported `mtp.layers.0.mlp: no routing stats for layer, tail placement unpermuted`;
+it is disabled in the standard profile.
+
+The CPU ISA observability check is exposed through `exl3_moe_cpu_has_avxvnni()` and the worker log.
+With `EXL3_MOE_CPU_MAX_ISA=avxvnni` it reports `avxvnni`; with `avx2` it reports `avx2`.
+The observability change was build/import/smoke-tested without a long benchmark rerun.
+
+CPU MoE optimization for this Flash-Next workload is considered complete. `rocprofv3` is unavailable
+because of the host-side API registration failure, and `perf` is unavailable under the host permission
+policy; no unverified profiler or synchronization optimization is part of this profile.
 
 ## Qwen3.8-Flash-Next results (RX 7900 XTX, Ryzen 9 7950X3D, 60 GB DDR5, ROCm 7.2.4)
 
@@ -72,9 +120,10 @@ all of them). More VRAM for experts is therefore the main lever: each extra GPU 
 hf download turboderp/Qwen3.8-Flash-Next-exl3 --revision 3.05bpw_h5_ng5 --local-dir models/Qwen3.8-Flash-Next-3.05bpw
 python rocm_tests/moe_stats.py -m models/Qwen3.8-Flash-Next-3.05bpw
 
-# generate: 346 of 512 experts per layer on the CPU (166 on the GPU), 12 worker threads
-EXL3_NOGRAPH=mlp,gdn,moe python rocm_tests/moe_gen.py -m models/Qwen3.8-Flash-Next-3.05bpw \
-    --mcs 346 --mct 12 --cache 131072 --kv_bits 8
+# generate: verified single-user profile for RX 7900 XTX + i7-12700F
+EXL3_NOGRAPH=mlp,gdn,moe EXL3_MOE_CPU_SWAP=0 EXL3_MOE_CPU_MAX_ISA=avxvnni EXL3_MOE_LEARN=0 \
+  taskset -c 0-15 python rocm_tests/moe_gen.py -m models/Qwen3.8-Flash-Next-3.05bpw \
+    --mcs 395 --mct 8 --cache 4096 --kv_bits 4 --tokens 128
 ```
 
 TabbyAPI (`config.yml`, model section):
